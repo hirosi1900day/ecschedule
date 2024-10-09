@@ -13,6 +13,7 @@ import (
 	cweTypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchevents/types"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	ecsTypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
+	"github.com/aws/aws-sdk-go-v2/service/sfn"
 	"github.com/goccy/go-yaml"
 	"github.com/sergi/go-diff/diffmatchpatch"
 )
@@ -483,12 +484,102 @@ func (r *Rule) Apply(ctx context.Context, awsConf aws.Config, dryRun bool) error
 	if _, err := svc.PutRule(ctx, r.PutRuleInput()); err != nil {
 		return err
 	}
-	if _, err = svc.PutTargets(ctx, r.PutTargetsInput()); err != nil {
+	var putTargetsInput *cloudwatchevents.PutTargetsInput
+	var enabledBridge bool
+	c := r.BaseConfig
+	clusterARN := fmt.Sprintf("arn:aws:ecs:%s:%s:cluster/%s", c.Region, c.AccountID, c.Cluster)
+
+	stateMachineDefinition := fmt.Sprintf(`{
+        "Comment": "ECS task runner Step Function",
+        "StartAt": "RunECSTask",
+        "States": {
+            "RunECSTask": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::ecs:runTask.sync",
+                "Parameters": {
+                    "Cluster": "%s",
+                    "TaskDefinition": "%s",
+                    "LaunchType": "FARGATE",
+                    "NetworkConfiguration": {
+                        "awsvpcConfiguration": {
+                            "Subnets": ["%s"],
+                            "AssignPublicIp": "ENABLED"
+                        }
+                    }
+                },
+                "End": true
+            }
+        }
+    }`, clusterARN, r.Target.taskDefinitionArn(r), r.Target.NetworkConfiguration.AwsVpcConfiguration.Subnets)
+
+	// Step Functionを作成または更新
+	sfnClient := sfn.NewFromConfig(awsConf)
+	stateMachineArn, err := createOrUpdateStepFunction(sfnClient, stateMachineDefinition)
+	if err != nil {
+		log.Fatalf("failed to create or update Step Function: %v", err)
+	}
+	fmt.Printf("Step Function ARN: %s\n", stateMachineArn)
+
+	if enabledBridge {
+		putTargetsInput = r.PutTargetsInput()
+	} else {
+		putTargetsInput = &cloudwatchevents.PutTargetsInput{
+			Rule: aws.String("MyEventBridgeRule"),
+			Targets: []cweTypes.Target{
+				{
+					Id:      aws.String("StepFunctionTarget"),
+					Arn:     aws.String(stateMachineArn),
+					RoleArn: aws.String("arn:aws:iam::YOUR_ACCOUNT_ID:role/YOUR_EXECUTION_ROLE"), // 適切なIAMロールARNを指定
+				},
+			},
+		}
+	}
+
+	if _, err = svc.PutTargets(ctx, putTargetsInput); err != nil {
 		return err
 	}
 	_, err = svc.TagResource(ctx, r.TagResourceInput())
 
 	return err
+}
+
+func createOrUpdateStepFunction(client *sfn.Client, definition string) (string, error) {
+	stateMachineName := "MyStateMachine"
+
+	// 既存のStep Functionをチェック
+	describeInput := &sfn.DescribeStateMachineInput{
+		StateMachineArn: aws.String(fmt.Sprintf("arn:aws:states:REGION:ACCOUNT_ID:stateMachine:%s", stateMachineName)),
+	}
+
+	_, err := client.DescribeStateMachine(context.TODO(), describeInput)
+	if err == nil {
+		// Step Functionが既に存在する場合は更新
+		updateInput := &sfn.UpdateStateMachineInput{
+			StateMachineArn: aws.String(fmt.Sprintf("arn:aws:states:REGION:ACCOUNT_ID:stateMachine:%s", stateMachineName)),
+			Definition:      aws.String(definition),
+			RoleArn:         aws.String("arn:aws:iam::YOUR_ACCOUNT_ID:role/YOUR_EXECUTION_ROLE"), // 適切なIAMロールARNを指定
+		}
+		_, err := client.UpdateStateMachine(context.TODO(), updateInput)
+		if err != nil {
+			return "", fmt.Errorf("failed to update state machine: %v", err)
+		}
+		return *updateInput.StateMachineArn, nil
+	}
+
+	// 新規作成
+	createInput := &sfn.CreateStateMachineInput{
+		Name:       aws.String(stateMachineName),
+		Definition: aws.String(definition),
+		RoleArn:    aws.String("arn:aws:iam::YOUR_ACCOUNT_ID:role/YOUR_EXECUTION_ROLE"), // 適切なIAMロールARNを指定
+		Type:       "STANDARD",
+	}
+
+	result, err := client.CreateStateMachine(context.TODO(), createInput)
+	if err != nil {
+		return "", err
+	}
+
+	return *result.StateMachineArn, nil
 }
 
 // Run the rule
