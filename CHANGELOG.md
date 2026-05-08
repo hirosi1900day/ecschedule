@@ -1,5 +1,7 @@
 # Changelog
 
+## [v0.17.2](https://github.com/hirosi1900day/ecschedule/commits/v0.17.2) - 2026-05-08
+
 ## [v0.17.2](https://github.com/Songmu/ecschedule/compare/v0.17.1...v0.17.2) - 2025-12-02
 - build(deps): bump github.com/goccy/go-yaml from 1.18.0 to 1.19.0 by @dependabot[bot] in https://github.com/Songmu/ecschedule/pull/221
 - build(deps): bump reviewdog/action-actionlint from 1.68.0 to 1.69.0 by @dependabot[bot] in https://github.com/Songmu/ecschedule/pull/222
